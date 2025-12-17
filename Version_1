@@ -1,0 +1,1436 @@
+import wx
+import wx.richtext as rt
+import wx.lib.scrolledpanel as scrolled
+import wx.aui as aui
+import colorsys
+import os
+import sys
+import json
+import re
+import time
+import datetime
+import threading
+import logging
+import traceback
+import platform
+        
+try:
+    from docx import Document
+    DOCX_AVAILABLE = True
+except ImportError:
+    DOCX_AVAILABLE = False
+
+logging.basicConfig(
+    filename='editor_debug.log',
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    filemode='w'
+)
+logger = logging.getLogger('ProEdit')
+
+def log_error(context, error):
+    """Helper to log exceptions with stack traces."""
+    msg = f"Error in {context}: {str(error)}"
+    logger.error(msg)
+    logger.error(traceback.format_exc())
+
+# -----------------------------------------------------------------------------
+# Configuration & Constants
+# -----------------------------------------------------------------------------
+CONFIG_FILE = "editor_config.json"
+APP_TITLE = "ProEdit: Professional Document Suite"
+DEFAULT_FONT_SIZE = 11
+DEFAULT_FONT_FACE = "Segoe UI" if platform.system() == "Windows" else "Helvetica"
+VERSION = "3.1.0-Ultimate"
+
+# -----------------------------------------------------------------------------
+# Theme Management
+# -----------------------------------------------------------------------------
+class Theme:
+    """
+    Handles application color palettes for Light and Dark modes.
+    Now supports extended palette for UI elements.
+    """
+    LIGHT = {
+        'bg': wx.Colour(245, 247, 250),
+        'panel': wx.Colour(255, 255, 255),
+        'text': wx.Colour(30, 41, 59),
+        'text_secondary': wx.Colour(100, 116, 139),
+        'accent': wx.Colour(59, 130, 246),       # Blue
+        'accent_hover': wx.Colour(37, 99, 235),
+        'border': wx.Colour(226, 232, 240),
+        'success': wx.Colour(34, 197, 94),       # Green
+        'warning': wx.Colour(249, 115, 22),      # Orange
+        'danger': wx.Colour(239, 68, 68),        # Red
+        'highlight': wx.Colour(191, 219, 254),
+        'highlight_current': wx.Colour(147, 197, 253),
+        'replace_highlight': wx.Colour(254, 215, 170),
+        'toolbar_bg': wx.Colour(248, 250, 252)
+    }
+
+    DARK = {
+        'bg': wx.Colour(15, 23, 42),
+        'panel': wx.Colour(30, 41, 59),
+        'text': wx.Colour(226, 232, 240),
+        'text_secondary': wx.Colour(148, 163, 184),
+        'accent': wx.Colour(96, 165, 250),
+        'accent_hover': wx.Colour(59, 130, 246),
+        'border': wx.Colour(51, 65, 85),
+        'success': wx.Colour(74, 222, 128),
+        'warning': wx.Colour(251, 146, 60),
+        'danger': wx.Colour(248, 113, 113),
+        'highlight': wx.Colour(30, 58, 138),
+        'highlight_current': wx.Colour(59, 130, 246),
+        'replace_highlight': wx.Colour(124, 45, 18),
+        'toolbar_bg': wx.Colour(23, 37, 84)
+    }
+
+    def __init__(self, is_dark=False):
+        self.is_dark = is_dark
+        self.colors = self.DARK if is_dark else self.LIGHT
+
+    def toggle(self):
+        """Switches between light and dark mode dictionaries."""
+        self.is_dark = not self.is_dark
+        self.colors = self.DARK if self.is_dark else self.LIGHT
+        return self.colors
+
+    def get(self, key):
+        """Safe getter for colors."""
+        return self.colors.get(key, wx.Colour(255, 0, 255)) # Magenta default on error
+
+# Global Theme Instance
+current_theme = Theme(is_dark=False)
+
+# -----------------------------------------------------------------------------
+# Configuration Manager
+# -----------------------------------------------------------------------------
+class ConfigManager:
+    """
+    Manages loading and saving application state (recent files, settings).
+    Implements a Singleton-like pattern via static methods.
+    """
+    @staticmethod
+    def load_config():
+        """Loads configuration from JSON file."""
+        if not os.path.exists(CONFIG_FILE):
+            logger.info("Config file not found, creating default.")
+            return ConfigManager.default_config()
+        try:
+            with open(CONFIG_FILE, 'r') as f:
+                data = json.load(f)
+                # Merge with default to ensure all keys exist
+                default = ConfigManager.default_config()
+                default.update(data)
+                return default
+        except Exception as e:
+            log_error("ConfigManager.load_config", e)
+            return ConfigManager.default_config()
+
+    @staticmethod
+    def default_config():
+        """Returns the default configuration dictionary."""
+        return {
+            "recent_files": [],
+            "dark_mode": False,
+            "auto_save": True,
+            "auto_save_interval": 60, # Seconds
+            "font_size": DEFAULT_FONT_SIZE,
+            "font_face": DEFAULT_FONT_FACE,
+            "window_size": [1200, 850],
+            "maximized": False
+        }
+
+    @staticmethod
+    def save_config(data):
+        """Saves configuration to JSON file."""
+        try:
+            with open(CONFIG_FILE, 'w') as f:
+                json.dump(data, f, indent=4)
+        except Exception as e:
+            log_error("ConfigManager.save_config", e)
+
+    @staticmethod
+    def add_recent_file(path):
+        """Adds a file path to the recent files list."""
+        if not path: return
+        data = ConfigManager.load_config()
+        if path in data['recent_files']:
+            data['recent_files'].remove(path)
+        data['recent_files'].insert(0, path)
+        data['recent_files'] = data['recent_files'][:10]  # Keep last 10
+        ConfigManager.save_config(data)
+
+# -----------------------------------------------------------------------------
+# Custom UI Components
+# -----------------------------------------------------------------------------
+class RoundedPanel(wx.Panel):
+    """
+    A panel with true anti-aliased rounded corners using GraphicsContext.
+    Used for the toolbar and search bar containers.
+    """
+    def __init__(self, parent, bg_color=None, border_color=None, radius=12, size=wx.DefaultSize):
+        super().__init__(parent, size=size)
+        self.SetBackgroundStyle(wx.BG_STYLE_PAINT)
+        self.bg_color = bg_color if bg_color else current_theme.get('panel')
+        self.border_color = border_color if border_color else current_theme.get('border')
+        self.radius = radius
+        self.Bind(wx.EVT_PAINT, self.OnPaint)
+        self.Bind(wx.EVT_SIZE, self.OnResize)
+
+    def UpdateColors(self):
+        """Updates colors based on current theme."""
+        self.bg_color = current_theme.get('panel')
+        self.border_color = current_theme.get('border')
+        self.Refresh()
+
+    def OnResize(self, event):
+        self.Refresh()
+        event.Skip()
+
+    def OnPaint(self, event):
+        """Draws the rounded rectangle using Vector Graphics."""
+        dc = wx.AutoBufferedPaintDC(self)
+        # Use parent background to simulate transparency on corners
+        parent_bg = self.GetParent().GetBackgroundColour()
+        dc.SetBackground(wx.Brush(parent_bg))
+        dc.Clear()
+        
+        gc = wx.GraphicsContext.Create(dc)
+        if gc:
+            w, h = self.GetSize()
+            
+            # Draw shadow (simulated)
+            gc.SetBrush(wx.Brush(wx.Colour(0, 0, 0, 10)))
+            gc.SetPen(wx.Pen(wx.TRANSPARENT_PEN))
+            gc.DrawRoundedRectangle(2, 2, w-4, h-4, self.radius)
+            
+            # Draw main background
+            gc.SetBrush(wx.Brush(self.bg_color))
+            gc.SetPen(wx.Pen(self.border_color, 1))
+            path = gc.CreatePath()
+            path.AddRoundedRectangle(0, 0, w-1, h-1, self.radius)
+            gc.DrawPath(path)
+
+class ModernButton(wx.Control):
+    """
+    A custom-drawn button with hover effects, click states, and rounded corners.
+    Supports scaling fonts and icons.
+    """
+    def __init__(self, parent, label, color=None, id=wx.ID_ANY, size=(100, 36)):
+        super().__init__(parent, id=id, size=size)
+        self.label = label
+        self.base_color = color if color else current_theme.get('accent')
+        self.hover_color = self._adjust_brightness(self.base_color, 0.85)
+        self.pressed_color = self._adjust_brightness(self.base_color, 0.7)
+        
+        self.is_hovered = False
+        self.is_pressed = False
+        
+        self.SetBackgroundStyle(wx.BG_STYLE_PAINT)
+        
+        # Event Bindings
+        self.Bind(wx.EVT_PAINT, self.OnPaint)
+        self.Bind(wx.EVT_ENTER_WINDOW, self.OnEnter)
+        self.Bind(wx.EVT_LEAVE_WINDOW, self.OnLeave)
+        self.Bind(wx.EVT_LEFT_DOWN, self.OnDown)
+        self.Bind(wx.EVT_LEFT_UP, self.OnUp)
+
+    def _adjust_brightness(self, color, factor):
+        """Helper to darken/lighten a color."""
+        r, g, b, a = color.Get(includeAlpha=True)
+        return wx.Colour(int(r * factor), int(g * factor), int(b * factor), a)
+
+    def OnEnter(self, event):
+        self.is_hovered = True
+        self.SetCursor(wx.Cursor(wx.CURSOR_HAND))
+        self.Refresh()
+
+    def OnLeave(self, event):
+        self.is_hovered = False
+        self.is_pressed = False
+        self.SetCursor(wx.Cursor(wx.CURSOR_ARROW))
+        self.Refresh()
+
+    def OnDown(self, event):
+        self.is_pressed = True
+        self.Refresh()
+
+    def OnUp(self, event):
+        if self.is_pressed:
+            self.is_pressed = False
+            self.Refresh()
+            # Fire standard button event
+            evt = wx.CommandEvent(wx.EVT_BUTTON.typeId, self.GetId())
+            evt.SetEventObject(self)
+            self.GetEventHandler().ProcessEvent(evt)
+
+    def OnPaint(self, event):
+        dc = wx.AutoBufferedPaintDC(self)
+        dc.SetBackground(wx.Brush(self.GetParent().GetBackgroundColour()))
+        dc.Clear()
+        
+        gc = wx.GraphicsContext.Create(dc)
+        if gc:
+            w, h = self.GetSize()
+            
+            # Determine Color
+            if self.is_pressed:
+                color = self.pressed_color
+            elif self.is_hovered:
+                color = self.hover_color
+            else:
+                color = self.base_color
+            
+            # Draw Button Body
+            gc.SetBrush(wx.Brush(color))
+            gc.SetPen(wx.Pen(wx.TRANSPARENT_PEN))
+            gc.DrawRoundedRectangle(0, 0, w, h, 6)
+            
+            # Draw Label
+            font_size = 10 if h > 30 else 8
+            font = wx.Font(font_size, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_BOLD)
+            gc.SetFont(font, wx.WHITE)
+            
+            tw, th = gc.GetTextExtent(self.label)
+            gc.DrawText(self.label, (w - tw) / 2, (h - th) / 2)
+
+class IconButton(wx.Control):
+    """
+    Small helper button for toolbar icons (Bold, Italic, Align).
+    """
+    def __init__(self, parent, label, tooltip="", id=wx.ID_ANY):
+        super().__init__(parent, id=id, size=(32, 32))
+        self.label = label
+        self.SetToolTip(tooltip)
+        self.is_hovered = False
+        
+        self.SetBackgroundStyle(wx.BG_STYLE_PAINT)
+        self.Bind(wx.EVT_PAINT, self.OnPaint)
+        self.Bind(wx.EVT_ENTER_WINDOW, self.OnEnter)
+        self.Bind(wx.EVT_LEAVE_WINDOW, self.OnLeave)
+        self.Bind(wx.EVT_LEFT_UP, self.OnUp)
+
+    def OnEnter(self, e):
+        self.is_hovered = True
+        self.Refresh()
+
+    def OnLeave(self, e):
+        self.is_hovered = False
+        self.Refresh()
+
+    def OnUp(self, e):
+        evt = wx.CommandEvent(wx.EVT_BUTTON.typeId, self.GetId())
+        evt.SetEventObject(self)
+        self.GetEventHandler().ProcessEvent(evt)
+
+    def OnPaint(self, e):
+        dc = wx.AutoBufferedPaintDC(self)
+        bg = current_theme.get('panel')
+        dc.SetBackground(wx.Brush(bg))
+        dc.Clear()
+        
+        if self.is_hovered:
+            dc.SetPen(wx.Pen(current_theme.get('accent')))
+            dc.SetBrush(wx.Brush(wx.Colour(200, 200, 200, 50)))
+            dc.DrawRoundedRectangle(0, 0, 32, 32, 4)
+            
+        font = self.GetFont()
+        font.SetWeight(wx.FONTWEIGHT_BOLD)
+        # Handle style visualization
+        if self.label == "B": font.SetWeight(wx.FONTWEIGHT_BOLD)
+        if self.label == "I": font.SetStyle(wx.FONTSTYLE_ITALIC)
+        if self.label == "U": font.SetUnderlined(True)
+        
+        dc.SetFont(font)
+        dc.SetTextForeground(current_theme.get('text'))
+        
+        tw, th = dc.GetTextExtent(self.label)
+        dc.DrawText(self.label, (32-tw)//2, (32-th)//2)
+
+# -----------------------------------------------------------------------------
+# Logic Handlers
+# -----------------------------------------------------------------------------
+
+class FileManager:
+    """
+    Handles File I/O operations (Read/Write for txt, rtf, docx).
+    Encapsulates logic to prevent MainFrame clutter.
+    """
+    @staticmethod
+    def read_file(path):
+        """Reads a file and returns (content, type)."""
+        ext = os.path.splitext(path)[1].lower()
+        content = ""
+        file_type = None
+
+        try:
+            if ext == '.rtf':
+                # RTF is handled natively by RichTextCtrl load method
+                return None, 'rtf'
+            
+            elif ext == '.docx':
+                if not DOCX_AVAILABLE:
+                    raise ImportError("python-docx library is missing.")
+                doc = Document(path)
+                content = '\n'.join([p.text for p in doc.paragraphs])
+                file_type = 'docx'
+            
+            else:
+                # Default to text
+                with open(path, 'r', encoding='utf-8', errors='replace') as f:
+                    content = f.read()
+                file_type = 'txt'
+                
+            return content, file_type
+            
+        except Exception as e:
+            log_error(f"FileManager.read_file({path})", e)
+            raise IOError(f"Error reading file: {str(e)}")
+
+    @staticmethod
+    def save_file(path, text_ctrl):
+        """Saves content from text_ctrl to path."""
+        ext = os.path.splitext(path)[1].lower()
+        
+        try:
+            if ext == '.rtf':
+                text_ctrl.SaveFile(path, rt.RICHTEXT_TYPE_RTF)
+            
+            elif ext == '.docx':
+                if not DOCX_AVAILABLE:
+                    raise ImportError("python-docx library is missing.")
+                doc = Document()
+                # Simple extraction: splitting lines. 
+                # Preserving formatting to DOCX is extremely complex without extensive libs.
+                content = text_ctrl.GetValue()
+                for line in content.split('\n'):
+                    doc.add_paragraph(line)
+                doc.save(path)
+                
+            else:
+                # Default Text Save
+                content = text_ctrl.GetValue()
+                with open(path, 'w', encoding='utf-8') as f:
+                    f.write(content)
+            
+            logger.info(f"File saved successfully: {path}")
+                    
+        except Exception as e:
+            log_error(f"FileManager.save_file({path})", e)
+            raise IOError(f"Error saving file: {str(e)}")
+
+class AnimationHandler:
+    """
+    Handles text highlighting animations for search results.
+    Creates a pulsing effect on found text.
+    """
+    def __init__(self, text_ctrl, callback=None):
+        self.text_ctrl = text_ctrl
+        self.timer = wx.Timer(text_ctrl)
+        self.text_ctrl.Bind(wx.EVT_TIMER, self._animate_step, self.timer)
+        self.callback = callback
+        
+        self.gradient_colors = self._generate_gradient()
+        self.current_frame = 0
+        self.active_range = None
+
+    def _generate_gradient(self):
+        """Generates a list of colors for the pulse animation."""
+        colors = []
+        steps = 10
+        start_h = 0.58  # Blue Hue
+        for i in range(steps):
+            sat = 0.3 + (i / steps) * 0.4
+            val = 0.95
+            r, g, b = colorsys.hsv_to_rgb(start_h, sat, val)
+            colors.append(wx.Colour(int(r*255), int(g*255), int(b*255)))
+        # Pulse back and forth
+        return colors + colors[::-1]
+
+    def start(self, start_pos, end_pos):
+        """Starts the animation for a specific text range."""
+        self.stop()
+        self.active_range = (start_pos, end_pos)
+        self.current_frame = 0
+        self.timer.Start(100) # 100ms per frame
+
+    def stop(self):
+        """Stops the animation."""
+        if self.timer.IsRunning():
+            self.timer.Stop()
+        self.active_range = None
+
+    def _animate_step(self, event):
+        """Called by timer to update color."""
+        if not self.active_range:
+            return
+
+        start, end = self.active_range
+        color = self.gradient_colors[self.current_frame % len(self.gradient_colors)]
+        
+        attr = rt.RichTextAttr()
+        attr.SetBackgroundColour(color)
+        
+        # Use Freeze/Thaw to prevent UI flickering
+        self.text_ctrl.Freeze()
+        self.text_ctrl.SetStyle(start, end, attr)
+        self.text_ctrl.Thaw()
+        
+        self.current_frame += 1
+
+# -----------------------------------------------------------------------------
+# Settings Dialog
+# -----------------------------------------------------------------------------
+class SettingsDialog(wx.Dialog):
+    """
+    A Dialog to configure application preferences.
+    """
+    def __init__(self, parent):
+        super().__init__(parent, title="Preferences", size=(400, 300))
+        self.config = ConfigManager.load_config()
+        self.InitUI()
+        self.CenterOnParent()
+
+    def InitUI(self):
+        panel = wx.Panel(self)
+        vbox = wx.BoxSizer(wx.VERTICAL)
+        
+        # Grid for options
+        grid = wx.FlexGridSizer(rows=4, cols=2, vgap=15, hgap=15)
+        
+        # Dark Mode
+        lbl_theme = wx.StaticText(panel, label="Dark Mode:")
+        self.chk_theme = wx.CheckBox(panel)
+        self.chk_theme.SetValue(self.config.get('dark_mode', False))
+        grid.Add(lbl_theme, 0, wx.ALIGN_CENTER_VERTICAL)
+        grid.Add(self.chk_theme, 0, wx.ALIGN_CENTER_VERTICAL)
+        
+        # Auto Save
+        lbl_autosave = wx.StaticText(panel, label="Auto Save:")
+        self.chk_autosave = wx.CheckBox(panel)
+        self.chk_autosave.SetValue(self.config.get('auto_save', True))
+        grid.Add(lbl_autosave, 0, wx.ALIGN_CENTER_VERTICAL)
+        grid.Add(self.chk_autosave, 0, wx.ALIGN_CENTER_VERTICAL)
+        
+        # Default Font Size
+        lbl_size = wx.StaticText(panel, label="Default Font Size:")
+        self.spin_size = wx.SpinCtrl(panel, min=6, max=72, initial=self.config.get('font_size', 11))
+        grid.Add(lbl_size, 0, wx.ALIGN_CENTER_VERTICAL)
+        grid.Add(self.spin_size, 0, wx.ALIGN_CENTER_VERTICAL)
+        
+        vbox.Add(grid, 1, wx.ALL | wx.EXPAND, 20)
+        
+        # Buttons
+        btn_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        btn_save = wx.Button(panel, label="Save")
+        btn_cancel = wx.Button(panel, label="Cancel")
+        
+        btn_save.Bind(wx.EVT_BUTTON, self.OnSave)
+        btn_cancel.Bind(wx.EVT_BUTTON, lambda e: self.EndModal(wx.ID_CANCEL))
+        
+        btn_sizer.Add(btn_cancel, 0, wx.RIGHT, 10)
+        btn_sizer.Add(btn_save, 0)
+        
+        vbox.Add(btn_sizer, 0, wx.ALIGN_CENTER | wx.BOTTOM, 20)
+        panel.SetSizer(vbox)
+
+    def OnSave(self, event):
+        self.config['dark_mode'] = self.chk_theme.GetValue()
+        self.config['auto_save'] = self.chk_autosave.GetValue()
+        self.config['font_size'] = self.spin_size.GetValue()
+        ConfigManager.save_config(self.config)
+        self.EndModal(wx.ID_OK)
+
+# -----------------------------------------------------------------------------
+# Document Components
+# -----------------------------------------------------------------------------
+
+class DocumentEditor(rt.RichTextCtrl):
+    """
+    The core editing widget. Wraps RichTextCtrl to add stats tracking,
+    custom shortcuts, and simplified formatting methods.
+    """
+    def __init__(self, parent):
+        super().__init__(parent, style=wx.VSCROLL | wx.HSCROLL | wx.NO_BORDER | wx.WANTS_CHARS)
+        
+        # Load Defaults
+        cfg = ConfigManager.load_config()
+        font = wx.Font(cfg.get('font_size', 11), wx.FONTFAMILY_DEFAULT, 
+                      wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_NORMAL, 
+                      False, cfg.get('font_face', "Segoe UI"))
+        self.SetFont(font)
+        
+        # Event Bindings
+        self.Bind(wx.EVT_TEXT, self.OnTextChanged)
+        self.Bind(wx.EVT_KEY_DOWN, self.OnKeyDown)
+
+    def OnTextChanged(self, event):
+        event.Skip()
+
+    def OnKeyDown(self, event):
+        """Handle custom hotkeys."""
+        key = event.GetKeyCode()
+        mod = event.GetModifiers()
+        
+        # Standard Formatting Hotkeys
+        if mod == wx.MOD_CONTROL:
+            if key == ord('B'):
+                self.ApplyBoldToSelection()
+                return
+            elif key == ord('I'):
+                self.ApplyItalicToSelection()
+                return
+            elif key == ord('U'):
+                self.ApplyUnderlineToSelection()
+                return
+            elif key == ord('='): # Zoom In
+                self._change_font_size(1)
+                return
+            elif key == ord('-'): # Zoom Out
+                self._change_font_size(-1)
+                return
+        
+        event.Skip()
+
+    def _change_font_size(self, delta):
+        """Quickly adjust font size of selection."""
+        attr = rt.RichTextAttr()
+        if self.GetStyle(self.GetInsertionPoint(), attr):
+            current = attr.GetFontSize()
+            new_size = max(6, current + delta)
+            
+            new_attr = rt.RichTextAttr()
+            new_attr.SetFontSize(new_size)
+            self.SetStyleEx(self.GetSelectionRange(), new_attr, rt.RICHTEXT_SETSTYLE_WITH_UNDO)
+
+    def GetStats(self):
+        """Returns (word_count, char_count)."""
+        text = self.GetValue()
+        words = len(text.split())
+        chars = len(text)
+        return words, chars
+
+    # --- Formatting Helpers ---
+    def SetFontFamily(self, face_name):
+        attr = rt.RichTextAttr()
+        attr.SetFontFaceName(face_name)
+        self.SetStyleEx(self.GetSelectionRange(), attr, rt.RICHTEXT_SETSTYLE_WITH_UNDO)
+
+    def SetFontSize(self, size):
+        attr = rt.RichTextAttr()
+        attr.SetFontSize(size)
+        self.SetStyleEx(self.GetSelectionRange(), attr, rt.RICHTEXT_SETSTYLE_WITH_UNDO)
+
+    def SetColor(self, color):
+        attr = rt.RichTextAttr()
+        attr.SetTextColour(color)
+        self.SetStyleEx(self.GetSelectionRange(), attr, rt.RICHTEXT_SETSTYLE_WITH_UNDO)
+
+    def SetHighlight(self, color):
+        attr = rt.RichTextAttr()
+        attr.SetBackgroundColour(color)
+        self.SetStyleEx(self.GetSelectionRange(), attr, rt.RICHTEXT_SETSTYLE_WITH_UNDO)
+
+    def AlignText(self, alignment):
+        """
+        alignment: wx.TEXT_ALIGNMENT_LEFT, wx.TEXT_ALIGNMENT_CENTER, etc.
+        """
+        attr = rt.RichTextAttr()
+        attr.SetAlignment(alignment)
+        self.SetStyleEx(self.GetSelectionRange(), attr, rt.RICHTEXT_SETSTYLE_WITH_UNDO)
+
+
+class DocumentTab(wx.Panel):
+    """
+    A wrapper for a single document tab.
+    Contains the Editor and metadata (file path, saved state).
+    """
+    def __init__(self, parent):
+        super().__init__(parent)
+        
+        self.file_path = None
+        self.is_modified = False
+        self.filename = "Untitled"
+        
+        self.sizer = wx.BoxSizer(wx.VERTICAL)
+        self.editor = DocumentEditor(self)
+        self.animator = AnimationHandler(self.editor)
+        
+        self.sizer.Add(self.editor, 1, wx.EXPAND)
+        self.SetSizer(self.sizer)
+        
+        # Bind modification event
+        self.editor.Bind(wx.EVT_TEXT, self.OnModify)
+
+    def OnModify(self, event):
+        if not self.is_modified:
+            self.is_modified = True
+            # Signal parent to update tab title (add *)
+            # This requires custom event propagation usually, 
+            # or direct parent call. For simplicity in this demo:
+            pass 
+        event.Skip()
+
+    def Load(self, path):
+        """Loads file content into this tab."""
+        try:
+            content, ftype = FileManager.read_file(path)
+            if ftype == 'rtf':
+                self.editor.LoadFile(path, rt.RICHTEXT_TYPE_RTF)
+            else:
+                self.editor.SetValue(content)
+            
+            self.file_path = path
+            self.filename = os.path.basename(path)
+            self.is_modified = False
+            return True
+        except Exception as e:
+            wx.MessageBox(f"Failed to load: {e}", "Error", wx.ICON_ERROR)
+            return False
+
+    def Save(self):
+        """Saves current content."""
+        if not self.file_path:
+            return self.SaveAs()
+        
+        try:
+            FileManager.save_file(self.file_path, self.editor)
+            self.is_modified = False
+            return True
+        except Exception as e:
+            wx.MessageBox(f"Failed to save: {e}", "Error", wx.ICON_ERROR)
+            return False
+
+    def SaveAs(self):
+        """Opens Save Dialog and saves."""
+        wildcard = "All Supported|*.txt;*.rtf;*.docx|Text Files|*.txt|Rich Text|*.rtf|Word Doc|*.docx"
+        with wx.FileDialog(self, "Save As", wildcard=wildcard, 
+                           style=wx.FD_SAVE | wx.FD_OVERWRITE_PROMPT) as dlg:
+            if dlg.ShowModal() == wx.ID_CANCEL:
+                return False
+            
+            path = dlg.GetPath()
+            self.file_path = path
+            self.filename = os.path.basename(path)
+            return self.Save()
+
+# -----------------------------------------------------------------------------
+# Main Application Window
+# -----------------------------------------------------------------------------
+class MainFrame(wx.Frame):
+    def __init__(self):
+        # Initial Window Setup
+        super().__init__(None, title=APP_TITLE, size=(1200, 850), style=wx.DEFAULT_FRAME_STYLE | wx.TAB_TRAVERSAL)
+        
+        self.config = ConfigManager.load_config()
+        
+        # Search State
+        self.search_occurrences = []
+        self.search_index = -1
+        
+        # Initialize UI Logic
+        self._init_ui()
+        self._init_menu()
+        self._apply_theme()
+        
+        # Auto-save Timer
+        self.autosave_timer = wx.Timer(self)
+        self.Bind(wx.EVT_TIMER, self.OnAutoSave, self.autosave_timer)
+        if self.config.get('auto_save'):
+            interval = self.config.get('auto_save_interval', 60) * 1000
+            self.autosave_timer.Start(interval)
+            
+        # Bind Close Event for safe exit
+        self.Bind(wx.EVT_CLOSE, self.OnCloseWindow)
+
+        # Apply previous window state
+        if self.config.get('maximized'):
+            self.Maximize()
+        
+        self.Centre()
+        self.Show()
+        
+        # Open a default blank tab
+        self.NewTab()
+
+    def _init_ui(self):
+        """Constructs the main GUI layout."""
+        self.main_panel = wx.Panel(self)
+        self.main_sizer = wx.BoxSizer(wx.VERTICAL)
+        
+        # 1. Main Toolbar
+        self._init_toolbar()
+        
+        # 2. Tabbed Editor Interface
+        self.notebook = aui.AuiNotebook(self.main_panel, style=aui.AUI_NB_TOP | aui.AUI_NB_TAB_SPLIT | aui.AUI_NB_SCROLL_BUTTONS | aui.AUI_NB_CLOSE_ON_ACTIVE_TAB)
+        self.notebook.Bind(aui.EVT_AUINOTEBOOK_PAGE_CHANGED, self.OnTabChanged)
+        self.notebook.Bind(aui.EVT_AUINOTEBOOK_PAGE_CLOSE, self.OnTabClose)
+        self.main_sizer.Add(self.notebook, 1, wx.EXPAND)
+        
+        # 3. Search Bar
+        self._init_search_bar()
+        
+        # 4. Status Bar
+        self.status_bar = self.CreateStatusBar(3)
+        self.status_bar.SetStatusWidths([-1, 150, 150])
+        self.status_bar.SetStatusText("Ready", 0)
+        
+        self.main_panel.SetSizer(self.main_sizer)
+
+    def _init_toolbar(self):
+        """Builds the comprehensive toolbar."""
+        self.toolbar_panel = RoundedPanel(self.main_panel, size=(-1, 80), radius=0)
+        tb_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        
+        # --- File Section ---
+        self.btn_new = ModernButton(self.toolbar_panel, "New", color=current_theme.get('accent'))
+        self.btn_open = ModernButton(self.toolbar_panel, "Open", color=current_theme.get('accent'))
+        self.btn_save = ModernButton(self.toolbar_panel, "Save", color=current_theme.get('success'))
+        self.btn_pdf = ModernButton(self.toolbar_panel, "PDF", color=wx.Colour(234, 88, 12))
+        
+        tb_sizer.Add(self.btn_new, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 5)
+        tb_sizer.Add(self.btn_open, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 5)
+        tb_sizer.Add(self.btn_save, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 5)
+        tb_sizer.Add(self.btn_pdf, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 5)
+        
+        # Separator
+        tb_sizer.Add(wx.StaticLine(self.toolbar_panel, style=wx.LI_VERTICAL, size=(2, 40)), 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 10)
+        
+        # --- Formatting Section ---
+        
+        # Font Face
+        fonts = wx.FontEnumerator()
+        fonts.EnumerateFacenames()
+        font_list = fonts.GetFacenames()
+        font_list.sort()
+        self.combo_font = wx.ComboBox(self.toolbar_panel, choices=font_list, style=wx.CB_READONLY, size=(150, -1))
+        self.combo_font.SetValue(DEFAULT_FONT_FACE)
+        self.combo_font.Bind(wx.EVT_COMBOBOX, self.OnFontChange)
+        tb_sizer.Add(self.combo_font, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 5)
+        
+        # Font Size
+        self.spin_size = wx.SpinCtrl(self.toolbar_panel, size=(60, -1), min=6, max=72, initial=11)
+        self.spin_size.Bind(wx.EVT_SPINCTRL, self.OnSizeChange)
+        tb_sizer.Add(self.spin_size, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 5)
+        
+        # Styles (Bold, Italic, Underline)
+        self.btn_bold = IconButton(self.toolbar_panel, "B", "Bold")
+        self.btn_bold.Bind(wx.EVT_BUTTON, self.OnBold)
+        
+        self.btn_italic = IconButton(self.toolbar_panel, "I", "Italic")
+        self.btn_italic.Bind(wx.EVT_BUTTON, self.OnItalic)
+        
+        self.btn_underline = IconButton(self.toolbar_panel, "U", "Underline")
+        self.btn_underline.Bind(wx.EVT_BUTTON, self.OnUnderline)
+        
+        tb_sizer.Add(self.btn_bold, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 2)
+        tb_sizer.Add(self.btn_italic, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 2)
+        tb_sizer.Add(self.btn_underline, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 2)
+
+        # Colors
+        self.btn_color = ModernButton(self.toolbar_panel, "Color", color=wx.Colour(100, 100, 100), size=(60, 30))
+        self.btn_color.Bind(wx.EVT_BUTTON, self.OnTextColor)
+        tb_sizer.Add(self.btn_color, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 5)
+        
+        # Alignment
+        tb_sizer.Add(wx.StaticLine(self.toolbar_panel, style=wx.LI_VERTICAL, size=(2, 40)), 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 10)
+        
+        btn_left = IconButton(self.toolbar_panel, "L", "Align Left")
+        btn_left.Bind(wx.EVT_BUTTON, lambda e: self.OnAlign(wx.TEXT_ALIGNMENT_LEFT))
+        
+        btn_center = IconButton(self.toolbar_panel, "C", "Align Center")
+        btn_center.Bind(wx.EVT_BUTTON, lambda e: self.OnAlign(wx.TEXT_ALIGNMENT_CENTER))
+        
+        btn_right = IconButton(self.toolbar_panel, "R", "Align Right")
+        btn_right.Bind(wx.EVT_BUTTON, lambda e: self.OnAlign(wx.TEXT_ALIGNMENT_RIGHT))
+
+        tb_sizer.Add(btn_left, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 2)
+        tb_sizer.Add(btn_center, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 2)
+        tb_sizer.Add(btn_right, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 2)
+        
+        tb_sizer.AddStretchSpacer()
+        
+        # --- Window Controls (Minimize/Close) ---
+        self.btn_minimize = ModernButton(self.toolbar_panel, "_", color=current_theme.get('text_secondary'), size=(40, 36))
+        self.btn_minimize.Bind(wx.EVT_BUTTON, self.OnMinimize)
+        
+        self.btn_close = ModernButton(self.toolbar_panel, "X", color=current_theme.get('danger'), size=(40, 36))
+        self.btn_close.Bind(wx.EVT_BUTTON, self.OnCloseBtn)
+        
+        tb_sizer.Add(self.btn_minimize, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 5)
+        tb_sizer.Add(self.btn_close, 0, wx.RIGHT | wx.ALIGN_CENTER_VERTICAL, 10)
+        
+        self.toolbar_panel.SetSizer(tb_sizer)
+        self.main_sizer.Add(self.toolbar_panel, 0, wx.EXPAND)
+        
+        # Bind Main Events
+        self.btn_new.Bind(wx.EVT_BUTTON, lambda e: self.NewTab())
+        self.btn_open.Bind(wx.EVT_BUTTON, self.OnOpen)
+        self.btn_save.Bind(wx.EVT_BUTTON, self.OnSave)
+        self.btn_pdf.Bind(wx.EVT_BUTTON, self.OnExportPDF)
+
+    def _init_search_bar(self):
+        """Constructs the bottom search and replace bar."""
+        self.search_panel = RoundedPanel(self.main_panel, radius=0)
+        search_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        
+        lbl_search = wx.StaticText(self.search_panel, label="Find:")
+        self.txt_search = wx.TextCtrl(self.search_panel, style=wx.TE_PROCESS_ENTER)
+        self.txt_search.Bind(wx.EVT_TEXT_ENTER, self.OnSearch)
+        
+        lbl_replace = wx.StaticText(self.search_panel, label="Replace:")
+        self.txt_replace = wx.TextCtrl(self.search_panel)
+        
+        self.chk_case = wx.CheckBox(self.search_panel, label="Match Case")
+        self.chk_regex = wx.CheckBox(self.search_panel, label="Regex")
+        
+        btn_find = wx.Button(self.search_panel, label="Find Next")
+        btn_find.Bind(wx.EVT_BUTTON, self.OnSearch)
+        
+        btn_replace = wx.Button(self.search_panel, label="Replace")
+        btn_replace.Bind(wx.EVT_BUTTON, self.OnReplaceOne)
+        
+        btn_replace_all = wx.Button(self.search_panel, label="Replace All")
+        btn_replace_all.Bind(wx.EVT_BUTTON, self.OnReplaceAll)
+        
+        self.lbl_matches = wx.StaticText(self.search_panel, label="Ready")
+        self.lbl_matches.SetForegroundColour(current_theme.get('text_secondary'))
+
+        widgets = [
+            (lbl_search, 0), (self.txt_search, 1), 
+            (lbl_replace, 0), (self.txt_replace, 1),
+            (self.chk_case, 0), (self.chk_regex, 0),
+            (btn_find, 0), (btn_replace, 0), (btn_replace_all, 0),
+            (self.lbl_matches, 0)
+        ]
+        
+        for widget, expand in widgets:
+            search_sizer.Add(widget, expand, wx.ALIGN_CENTER_VERTICAL | wx.ALL, 5)
+            
+        self.search_panel.SetSizer(search_sizer)
+        self.main_sizer.Add(self.search_panel, 0, wx.EXPAND | wx.ALL, 10)
+
+    def _init_menu(self):
+        """Creates the application menu bar."""
+        menubar = wx.MenuBar()
+        
+        # File Menu
+        file_menu = wx.Menu()
+        m_new = file_menu.Append(wx.ID_NEW, "&New Tab\tCtrl+N")
+        m_open = file_menu.Append(wx.ID_OPEN, "&Open\tCtrl+O")
+        m_save = file_menu.Append(wx.ID_SAVE, "&Save\tCtrl+S")
+        m_saveas = file_menu.Append(wx.ID_SAVEAS, "Save &As...\tCtrl+Shift+S")
+        file_menu.AppendSeparator()
+        
+        self.recent_menu = wx.Menu()
+        self._update_recent_menu()
+        file_menu.AppendSubMenu(self.recent_menu, "Recent Files")
+        file_menu.AppendSeparator()
+        
+        m_pref = file_menu.Append(wx.ID_PREFERENCES, "Pre&ferences")
+        file_menu.AppendSeparator()
+        m_exit = file_menu.Append(wx.ID_EXIT, "E&xit")
+        
+        # Edit Menu
+        edit_menu = wx.Menu()
+        m_undo = edit_menu.Append(wx.ID_UNDO, "&Undo\tCtrl+Z")
+        m_redo = edit_menu.Append(wx.ID_REDO, "&Redo\tCtrl+Y")
+        edit_menu.AppendSeparator()
+        m_cut = edit_menu.Append(wx.ID_CUT, "Cu&t\tCtrl+X")
+        m_copy = edit_menu.Append(wx.ID_COPY, "&Copy\tCtrl+C")
+        m_paste = edit_menu.Append(wx.ID_PASTE, "&Paste\tCtrl+V")
+        
+        # View Menu
+        view_menu = wx.Menu()
+        m_theme = view_menu.Append(wx.ID_ANY, "Toggle Dark Mode")
+        
+        # Help Menu
+        help_menu = wx.Menu()
+        m_about = help_menu.Append(wx.ID_ABOUT, "&About")
+        
+        menubar.Append(file_menu, "&File")
+        menubar.Append(edit_menu, "&Edit")
+        menubar.Append(view_menu, "&View")
+        menubar.Append(help_menu, "&Help")
+        
+        self.SetMenuBar(menubar)
+        
+        # Bindings
+        self.Bind(wx.EVT_MENU, lambda e: self.NewTab(), m_new)
+        self.Bind(wx.EVT_MENU, self.OnOpen, m_open)
+        self.Bind(wx.EVT_MENU, self.OnSave, m_save)
+        self.Bind(wx.EVT_MENU, self.OnSaveAs, m_saveas)
+        self.Bind(wx.EVT_MENU, self.OnPreferences, m_pref)
+        self.Bind(wx.EVT_MENU, self.OnExit, m_exit)
+        
+        self.Bind(wx.EVT_MENU, self.OnUndo, m_undo)
+        self.Bind(wx.EVT_MENU, self.OnRedo, m_redo)
+        self.Bind(wx.EVT_MENU, self.OnCut, m_cut)
+        self.Bind(wx.EVT_MENU, self.OnCopy, m_copy)
+        self.Bind(wx.EVT_MENU, self.OnPaste, m_paste)
+        
+        self.Bind(wx.EVT_MENU, self.OnToggleTheme, m_theme)
+        self.Bind(wx.EVT_MENU, self.OnAbout, m_about)
+
+    def _apply_theme(self):
+        """Recursively applies colors to all UI elements."""
+        colors = current_theme.colors
+        self.main_panel.SetBackgroundColour(colors['bg'])
+        self.toolbar_panel.UpdateColors()
+        self.search_panel.UpdateColors()
+        
+        # Update styling of all tabs
+        for i in range(self.notebook.GetPageCount()):
+            page = self.notebook.GetPage(i)
+            # Assuming page is DocumentTab
+            if isinstance(page, DocumentTab):
+                bg = wx.Colour(40, 40, 40) if current_theme.is_dark else wx.Colour(255, 255, 255)
+                fg = wx.WHITE if current_theme.is_dark else wx.BLACK
+                page.editor.SetBackgroundColour(bg)
+                page.editor.SetForegroundColour(fg)
+        
+        self.Refresh()
+
+    def _update_recent_menu(self):
+        """Rebuilds the recent files submenu."""
+        for item in self.recent_menu.GetMenuItems():
+            self.recent_menu.Delete(item)
+            
+        files = self.config.get('recent_files', [])
+        if not files:
+            self.recent_menu.Append(wx.ID_ANY, "No recent files").Enable(False)
+        else:
+            for fpath in files:
+                item = self.recent_menu.Append(wx.ID_ANY, fpath)
+                self.Bind(wx.EVT_MENU, lambda e, p=fpath: self.LoadFileInNewTab(p), item)
+
+    # -------------------------------------------------------------------------
+    # Tab Management
+    # -------------------------------------------------------------------------
+    def NewTab(self, title="Untitled"):
+        """Creates a new document tab."""
+        tab = DocumentTab(self.notebook)
+        # Apply current theme to new tab immediately
+        bg = wx.Colour(40, 40, 40) if current_theme.is_dark else wx.Colour(255, 255, 255)
+        fg = wx.WHITE if current_theme.is_dark else wx.BLACK
+        tab.editor.SetBackgroundColour(bg)
+        tab.editor.SetForegroundColour(fg)
+        
+        self.notebook.AddPage(tab, title, select=True)
+        # Re-bind events for the new editor instance so MainFrame sees stats updates
+        tab.editor.Bind(wx.EVT_TEXT, self.OnEditorText)
+        return tab
+
+    def GetCurrentTab(self):
+        """Returns the currently active DocumentTab."""
+        sel = self.notebook.GetSelection()
+        if sel != wx.NOT_FOUND:
+            return self.notebook.GetPage(sel)
+        return None
+
+    def OnTabChanged(self, event):
+        """Handle stats update when switching tabs."""
+        self.UpdateStats()
+        event.Skip()
+
+    def OnTabClose(self, event):
+        """Prevent closing dirty tabs without prompt."""
+        sel = event.GetSelection()
+        tab = self.notebook.GetPage(sel)
+        if tab.is_modified:
+            res = wx.MessageBox(f"Save changes to '{tab.filename}' before closing?", 
+                                "Unsaved Changes", 
+                                wx.YES_NO | wx.CANCEL | wx.ICON_QUESTION)
+            if res == wx.YES:
+                if not tab.Save():
+                    event.Veto() # Cancel close if save failed/cancelled
+                    return
+            elif res == wx.CANCEL:
+                event.Veto()
+                return
+        event.Skip()
+
+    # -------------------------------------------------------------------------
+    # File Operations
+    # -------------------------------------------------------------------------
+    def OnOpen(self, event):
+        wildcard = "All Supported|*.txt;*.rtf;*.docx|Text Files|*.txt|Rich Text|*.rtf|Word Doc|*.docx"
+        with wx.FileDialog(self, "Open File", wildcard=wildcard, 
+                           style=wx.FD_OPEN | wx.FD_FILE_MUST_EXIST) as dlg:
+            if dlg.ShowModal() == wx.ID_CANCEL:
+                return
+            path = dlg.GetPath()
+            self.LoadFileInNewTab(path)
+
+    def LoadFileInNewTab(self, path):
+        # Check if already open
+        for i in range(self.notebook.GetPageCount()):
+            page = self.notebook.GetPage(i)
+            if page.file_path == path:
+                self.notebook.SetSelection(i)
+                return
+
+        tab = self.NewTab(os.path.basename(path))
+        if tab.Load(path):
+            ConfigManager.add_recent_file(path)
+            self._update_recent_menu()
+            self.UpdateStats()
+            self.status_bar.SetStatusText(f"Opened: {path}", 0)
+        else:
+            # Close tab if load failed
+            self.notebook.DeletePage(self.notebook.GetSelection())
+
+    def OnSave(self, event):
+        tab = self.GetCurrentTab()
+        if tab:
+            if tab.Save():
+                self.status_bar.SetStatusText("Saved", 0)
+                self.notebook.SetPageText(self.notebook.GetSelection(), tab.filename)
+
+    def OnSaveAs(self, event):
+        tab = self.GetCurrentTab()
+        if tab:
+            if tab.SaveAs():
+                self.status_bar.SetStatusText("Saved As", 0)
+                self.notebook.SetPageText(self.notebook.GetSelection(), tab.filename)
+                ConfigManager.add_recent_file(tab.file_path)
+                self._update_recent_menu()
+
+    def OnAutoSave(self, event):
+        # Iterate all tabs
+        for i in range(self.notebook.GetPageCount()):
+            page = self.notebook.GetPage(i)
+            if page.file_path and page.is_modified:
+                try:
+                    temp_path = page.file_path + ".autosave"
+                    FileManager.save_file(temp_path, page.editor)
+                except Exception as e:
+                    logger.error(f"Autosave failed for {page.filename}: {e}")
+        
+        self.status_bar.SetStatusText(f"Autosaved at {datetime.datetime.now().strftime('%H:%M')}", 2)
+
+    def OnExportPDF(self, event):
+        tab = self.GetCurrentTab()
+        if not tab: return
+        printing = rt.RichTextPrinting(APP_TITLE)
+        printing.GetPageSetupData().SetMarginTopLeft((15, 15))
+        printing.GetPageSetupData().SetMarginBottomRight((15, 15))
+        printing.PrintBuffer(tab.editor.GetBuffer())
+
+    # -------------------------------------------------------------------------
+    # Formatting Handlers
+    # -------------------------------------------------------------------------
+    def OnFontChange(self, event):
+        tab = self.GetCurrentTab()
+        if tab:
+            font = self.combo_font.GetValue()
+            tab.editor.SetFontFamily(font)
+            # Focus back to editor
+            tab.editor.SetFocus()
+
+    def OnSizeChange(self, event):
+        tab = self.GetCurrentTab()
+        if tab:
+            size = self.spin_size.GetValue()
+            tab.editor.SetFontSize(size)
+            tab.editor.SetFocus()
+
+    def OnBold(self, event):
+        tab = self.GetCurrentTab()
+        if tab: tab.editor.ApplyBoldToSelection()
+
+    def OnItalic(self, event):
+        tab = self.GetCurrentTab()
+        if tab: tab.editor.ApplyItalicToSelection()
+
+    def OnUnderline(self, event):
+        tab = self.GetCurrentTab()
+        if tab: tab.editor.ApplyUnderlineToSelection()
+
+    def OnTextColor(self, event):
+        tab = self.GetCurrentTab()
+        if not tab: return
+        
+        data = wx.ColourData()
+        data.SetColour(current_theme.get('text'))
+        dlg = wx.ColourDialog(self, data)
+        if dlg.ShowModal() == wx.ID_OK:
+            color = dlg.GetColourData().GetColour()
+            tab.editor.SetColor(color)
+        dlg.Destroy()
+
+    def OnAlign(self, alignment):
+        tab = self.GetCurrentTab()
+        if tab: tab.editor.AlignText(alignment)
+
+    # -------------------------------------------------------------------------
+    # Edit Menu Handlers
+    # -------------------------------------------------------------------------
+    def OnUndo(self, e):
+        tab = self.GetCurrentTab()
+        if tab: tab.editor.Undo()
+
+    def OnRedo(self, e):
+        tab = self.GetCurrentTab()
+        if tab: tab.editor.Redo()
+
+    def OnCut(self, e):
+        tab = self.GetCurrentTab()
+        if tab: tab.editor.Cut()
+
+    def OnCopy(self, e):
+        tab = self.GetCurrentTab()
+        if tab: tab.editor.Copy()
+
+    def OnPaste(self, e):
+        tab = self.GetCurrentTab()
+        if tab: tab.editor.Paste()
+
+    # -------------------------------------------------------------------------
+    # Search & Replace
+    # -------------------------------------------------------------------------
+    def _clear_highlights(self):
+        tab = self.GetCurrentTab()
+        if not tab: return
+        
+        # Reset background
+        attr = rt.RichTextAttr()
+        default_bg = wx.WHITE if not current_theme.is_dark else wx.Colour(40,40,40)
+        attr.SetBackgroundColour(default_bg)
+        
+        # RichTextCtrl doesn't have a simple "Clear All Styles" that preserves fonts
+        # So we scan the full range.
+        basic_attr = rt.RichTextAttr()
+        basic_attr.SetFlags(wx.TEXT_ATTR_BACKGROUND_COLOUR) 
+        basic_attr.SetBackgroundColour(default_bg)
+        tab.editor.SetStyle(0, len(tab.editor.GetValue()), basic_attr)
+
+    def OnSearch(self, event):
+        term = self.txt_search.GetValue()
+        if not term: return
+        
+        tab = self.GetCurrentTab()
+        if not tab: return
+        
+        self._clear_highlights()
+        tab.animator.stop()
+        
+        content = tab.editor.GetValue()
+        self.search_occurrences = []
+        is_regex = self.chk_regex.GetValue()
+        
+        try:
+            if is_regex:
+                pattern_flags = 0 if self.chk_case.GetValue() else re.IGNORECASE
+                for match in re.finditer(term, content, pattern_flags):
+                    self.search_occurrences.append(match.span())
+            else:
+                if not self.chk_case.GetValue():
+                    content = content.lower()
+                    term = term.lower()
+                
+                start = 0
+                while True:
+                    idx = content.find(term, start)
+                    if idx == -1: break
+                    self.search_occurrences.append((idx, idx + len(term)))
+                    start = idx + len(term)
+        except re.error:
+            self.lbl_matches.SetLabel("Invalid Regex")
+            return
+
+        count = len(self.search_occurrences)
+        self.lbl_matches.SetLabel(f"{count} found")
+        
+        if count > 0:
+            attr = rt.RichTextAttr()
+            attr.SetBackgroundColour(current_theme.get('highlight'))
+            
+            tab.editor.Freeze()
+            for start, end in self.search_occurrences:
+                tab.editor.SetStyle(start, end, attr)
+            tab.editor.Thaw()
+            
+            self.search_index = -1
+            self._next_match()
+        else:
+            self.search_index = -1
+
+    def _next_match(self):
+        if not self.search_occurrences: return
+        tab = self.GetCurrentTab()
+        if not tab: return
+        
+        self.search_index = (self.search_index + 1) % len(self.search_occurrences)
+        start, end = self.search_occurrences[self.search_index]
+        
+        tab.editor.SetFocus()
+        tab.editor.SetSelection(start, end)
+        tab.editor.ShowPosition(start)
+        
+        tab.animator.start(start, end)
+        self.lbl_matches.SetLabel(f"{self.search_index + 1}/{len(self.search_occurrences)}")
+
+    def OnReplaceOne(self, event):
+        if not self.search_occurrences or self.search_index == -1:
+            self.OnSearch(None)
+            if not self.search_occurrences: return
+        
+        tab = self.GetCurrentTab()
+        start, end = self.search_occurrences[self.search_index]
+        replacement = self.txt_replace.GetValue()
+        
+        tab.editor.Replace(start, end, replacement)
+        # Re-run search to update indices
+        self.OnSearch(None)
+
+    def OnReplaceAll(self, event):
+        term = self.txt_search.GetValue()
+        replacement = self.txt_replace.GetValue()
+        if not term: return
+        
+        tab = self.GetCurrentTab()
+        if not tab: return
+        
+        content = tab.editor.GetValue()
+        new_content = content
+        
+        if not self.chk_regex.GetValue():
+            # Standard string replacement
+            if not self.chk_case.GetValue():
+                # Case insensitive string replace
+                pattern = re.compile(re.escape(term), re.IGNORECASE)
+                new_content = pattern.sub(replacement, content)
+            else:
+                new_content = content.replace(term, replacement)
+        else:
+            try:
+                new_content = re.sub(term, replacement, content)
+            except re.error:
+                return
+
+        tab.editor.SetValue(new_content)
+        self._clear_highlights()
+        self.lbl_matches.SetLabel("Replaced All")
+        self.search_occurrences = []
+
+    # -------------------------------------------------------------------------
+    # System Events
+    # -------------------------------------------------------------------------
+    def OnPreferences(self, event):
+        dlg = SettingsDialog(self)
+        if dlg.ShowModal() == wx.ID_OK:
+            self.config = ConfigManager.load_config()
+            self._apply_theme()
+            # Update fonts on active editor? 
+            # Usually better to let user manually change or restart
+        dlg.Destroy()
+
+    def OnToggleTheme(self, event):
+        current_theme.toggle()
+        self._apply_theme()
+        self.config['dark_mode'] = current_theme.is_dark
+        ConfigManager.save_config(self.config)
+
+    def OnEditorText(self, event):
+        self.UpdateStats()
+        event.Skip()
+
+    def UpdateStats(self):
+        tab = self.GetCurrentTab()
+        if tab:
+            words, chars = tab.editor.GetStats()
+            self.status_bar.SetStatusText(f"Words: {words} | Chars: {chars}", 1)
+        else:
+            self.status_bar.SetStatusText("", 1)
+
+    def OnMinimize(self, event):
+        self.Iconize(True)
+
+    def OnCloseBtn(self, event):
+        self.Close()
+
+    def OnCloseWindow(self, event):
+        """
+        Iterates through all tabs checking for modifications.
+        """
+        # Save window size
+        w, h = self.GetSize()
+        self.config['window_size'] = [w, h]
+        self.config['maximized'] = self.IsMaximized()
+        ConfigManager.save_config(self.config)
+        
+        # Check all tabs
+        veto = False
+        page_count = self.notebook.GetPageCount()
+        
+        for i in range(page_count):
+            
+            
+            page = self.notebook.GetPage(i)
+            if page.is_modified:
+                self.notebook.SetSelection(i)
+                res = wx.MessageBox(f"'{page.filename}' has unsaved changes. Save now?", 
+                                    "Exit Confirmation", 
+                                    wx.YES_NO | wx.CANCEL | wx.ICON_QUESTION)
+                if res == wx.YES:
+                    if not page.Save():
+                        veto = True
+                        break
+                elif res == wx.CANCEL:
+                    veto = True
+                    break
+        
+        if veto:
+            event.Veto()
+        else:
+            event.Skip()
+
+    def OnAbout(self, event):
+        info = wx.AboutDialogInfo()
+        info.SetName(APP_TITLE)
+        info.SetVersion(VERSION)
+        info.SetDescription("A high-performance document editor built with wxPython.\n\n"
+                            "Features:\n"
+                            "- Multi-tab Interface\n"
+                            "- Regex Search & Replace\n"
+                            "- DOCX/RTF/TXT Support\n"
+                            "- Dark Mode\n"
+                            "- PDF Export\n"
+                            "- Custom UI")
+        info.SetCopyright("(C) 2023 Open Source")
+        
+        
+        if os.path.exists("icon.png"):
+            info.SetIcon(wx.Icon("icon.png", wx.BITMAP_TYPE_PNG))
+            
+        wx.AboutBox(info)
+
+    def OnExit(self, event):
+        self.Close()
+
+class ProEditApp(wx.App):
+    def OnInit(self):
+        # Set up global exception hook for GUI crash logging
+        sys.excepthook = self.ExceptionHandler
+        
+        # Initialize config
+        self.config = ConfigManager.load_config()
+        if self.config.get('dark_mode'):
+            current_theme.toggle()
+            
+        self.frame = MainFrame()
+        self.SetTopWindow(self.frame)
+        return True
+
+    def ExceptionHandler(self, etype, value, trace):
+        """Catches unhandled exceptions and logs them."""
+        msg = "".join(traceback.format_exception(etype, value, trace))
+        logger.critical("Unhandled Exception:\n" + msg)
+        wx.MessageBox(f"An unexpected error occurred:\n{value}\n\nCheck logs for details.", 
+                      "Critical Error", wx.ICON_ERROR)
+
+if __name__ == "__main__":
+    app = ProEditApp(False)
+    app.MainLoop()
